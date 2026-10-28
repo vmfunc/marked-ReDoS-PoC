@@ -1,63 +1,84 @@
-# marked ReDoS / OOM - quadratic emphasis parsing + memory exhaustion via nested lists
-## overview
-[marked](https://github.com/markedjs/marked) v17.0.4 (and all current versions) has two algorithmic complexity vulnerabilities that allow denial of service via crafted markdown input.
-1. the emphasis (bold/italic) parser exhibits O(n²) time complexity on unclosed delimiters
-2. the list tokenizer has superlinear memory consumption on deeply nested lists (up to 496x input amplification)
-both are exploitable with small inputs (<50KB) and require no authentication. any endpoint accepting markdown is vulnerable.
-this was reported privately via GHSA (GHSA-2j45-q7r7-rpfj). the maintainer closed the advisory without publishing, stating it is "not a vulnerability" but rather a problem with the caller's implementation. per [GitHub's own documentation](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/fix-reported-vulnerabilities/managing-privately-reported-security-vulnerabilities):
-> "If you have enough information to determine that the problem the reporter describes is not a security risk, click Close security advisory."
-the maintainer exercised this option. the responsible disclosure window is over.
-## why this is a vulnerability
-this violates [OWASP's Secure by Default principle](https://devguide.owasp.org/en/02-foundations/03-security-principles/). a library should be safe out of the box without requiring callers to implement mitigations. documentation is not a security control.
-the maintainer's position is that users should use [web workers](https://marked.js.org/using_advanced#workers) when parsing untrusted markdown. by that logic, no parsing library would ever have security issues because you could always say "the caller should have sandboxed it."
-marked already has CVEs for this exact class of bug:
-- **CVE-2022-21680**: ReDoS in marked's heading parsing
-- **CVE-2022-21681**: ReDoS in marked's inline parsing
-both are still active in the NVD. neither has been revoked or disputed. this is the same class of issue, reported through the same process. the only thing that changed is the maintainer's willingness to engage with it.
-## finding 1 - quadratic emphasis parsing (CWE-407)
-the inline tokenizer's emStrong delimiter matching scans backwards through accumulated delimiter candidates. when input contains many unclosed emphasis openers (`*a ` repeated N times), each new opener must consider all previous openers, producing O(n²) total work.
-**pattern:** `"*a ".repeat(N)`
-**timing measurements on marked v17.0.4:**
-- N=2000 (6 KB): ~0.8ms
-- N=4000 (12 KB): ~3ms
-- N=8000 (24 KB): ~12ms
-- N=16000 (48 KB): ~35-38 seconds
-doubling input roughly quadruples time. textbook quadratic.
-### PoC
+# Marked ReDoS and OOM Vulnerabilities Quadratic Emphasis Parsing and Nested List Memory Exhaustion
+
+## Overview
+Marked version 17.0.4 and all current releases contain two algorithmic complexity issues that enable denial of service through specially crafted Markdown input.
+
+1. The emphasis parser for bold and italic text demonstrates quadratic time complexity when processing unclosed delimiters.
+2. The list tokenizer exhibits superlinear memory consumption when handling deeply nested lists, reaching amplification factors of approximately 496 times the input size.
+
+Both issues can be triggered by payloads smaller than 50 KB and require no authentication. Any service that accepts and parses untrusted Markdown is exposed.
+
+The findings were privately disclosed through a GitHub Security Advisory identified as GHSA-2j45-q7r7-rpfj. The project maintainer closed the advisory without publication and classified the behavior as an implementation concern belonging to the caller rather than a library vulnerability. GitHub documentation states that an advisory may be closed when sufficient information exists to conclude the reported issue does not constitute a security risk. The maintainer exercised that option and the responsible disclosure period has therefore concluded.
+
+## Rationale for Classification as a Vulnerability
+The observed behavior conflicts with the Secure by Default principle articulated by OWASP. A parsing library is expected to remain safe under normal use without forcing every caller to add external mitigations. Documentation alone does not constitute an effective security control.
+
+The maintainer has recommended that consumers place parsing of untrusted Markdown inside web workers. Under that reasoning virtually no parsing library could ever be considered to contain a security defect because isolation could always be delegated to the caller.
+
+Marked already carries two prior CVEs of the identical class
+- CVE-2022-21680 covering ReDoS in heading parsing
+- CVE-2022-21681 covering ReDoS in inline parsing
+
+Both entries remain active in the National Vulnerability Database and have neither been revoked nor disputed. The present findings belong to the same category of defect, were reported through the same channel, and differ only in the maintainer’s current disposition toward formal recognition.
+
+## Finding 1 Quadratic Emphasis Parsing (CWE-407)
+The inline tokenizer maintains a list of candidate emphasis delimiters and repeatedly scans that list in reverse. When the input consists of a long sequence of unclosed openers of the form “*a ” repeated N times, every newly encountered opener must examine every preceding opener. The resulting work is quadratic in the length of the input.
+
+Pattern used for measurement
+“*a ”.repeat(N)
+
+Observed timings on marked 17.0.4
+- N equals 2000 (approximately 6 KB) finishes in roughly 0.8 ms
+- N equals 4000 (approximately 12 KB) finishes in roughly 3 ms
+- N equals 8000 (approximately 24 KB) finishes in roughly 12 ms
+- N equals 16000 (approximately 48 KB) requires 35 to 38 seconds
+
+Doubling the input length multiplies the elapsed time by a factor close to four, confirming quadratic scaling.
+
+### Proof of Concept
 ```js
-const { marked } = require('marked');
-// 48KB payload - takes ~35 seconds on v17.0.4
-const payload = '*a '.repeat(16000);
-console.time('parse');
-marked.parse(payload);
-console.timeEnd('parse');
+const { marked } = require('marked')
+// 48 KB payload that consumes roughly 35 seconds on version 17.0.4
+const payload = '*a '.repeat(16000)
+console.time('parse')
+marked.parse(payload)
+console.timeEnd('parse')
 ```
-## finding 2 - nested list memory exhaustion (CWE-770)
-deeply nested markdown lists cause superlinear heap consumption in the tokenizer. each nesting level creates token objects with nested arrays, amplifying memory use far beyond input size.
-**pattern:** `Array.from({length: depth}, (_, i) => ' '.repeat(i) + '- item').join('\\n')`
-**memory measurements:**
-- depth=500 (12.5 KB input): ~50 MB heap
-- depth=750 (28 KB input): ~172 MB heap
-- depth=1000 (500 KB input): Node.js OOM crash
-this is heap exhaustion, not stack overflow. the process crashes with "JavaScript heap out of memory."
-### PoC
+
+## Finding 2 Nested List Memory Exhaustion (CWE-770)
+Deeply nested unordered lists force the tokenizer to allocate nested token objects whose size grows superlinearly with nesting depth. Heap consumption quickly exceeds the size of the original input and can exhaust the JavaScript heap.
+
+Pattern used for measurement
+Array.from({length depth}, (_, i) => ' '.repeat(i) + '- item').join('\\n')
+
+Observed memory consumption
+- depth equals 500 (approximately 12.5 KB input) consumes roughly 50 MB of heap
+- depth equals 750 (approximately 28 KB input) consumes roughly 172 MB of heap
+- depth equals 1000 (approximately 500 KB input) produces an immediate out-of-memory crash
+
+The failure mode is heap exhaustion rather than stack overflow. The process terminates with the message “JavaScript heap out of memory.”
+
+### Proof of Concept
 ```js
-const { marked } = require('marked');
-// generates ~500KB input - crashes Node.js
-const depth = 1000;
-const payload = Array.from({length: depth}, (_, i) =>
+const { marked } = require('marked')
+// Payload of roughly 500 KB that triggers an out-of-memory crash
+const depth = 1000
+const payload = Array.from({length depth}, (_, i) =>
   ' '.repeat(i) + '- item'
-).join('\\n');
-console.log('input size:', payload.length, 'bytes');
-marked.parse(payload); // crashes with OOM
+).join('\\n')
+console.log('input size', payload.length, 'bytes')
+marked.parse(payload)
 ```
-## impact
-any application using marked to parse user-supplied markdown on the server side is vulnerable to denial of service. the emphasis attack requires only 48KB of input to hang a single-threaded Node.js server for 35+ seconds. the nested list attack crashes the process entirely with <500KB of input.
-## timeline
-- **2026-03-04**: reported via GHSA to markedjs/marked
-- **2026-03-05**: maintainer closed advisory, stating "not a vulnerability" and "unsafe implementation"
-- **2026-03-06**: responded with technical arguments and prior CVE precedent
-- **2026-03-06**: maintainer reiterated position, stated prior CVEs were issued before workers were documented
-- **2026-03-06**: public disclosure (advisory closed without publishing = disclosure obligation fulfilled per GitHub docs)
-## credit
-discovered by [vmfunc](https://github.com/vmfunc)
+
+## Impact
+Any server-side application that invokes marked on user-controlled Markdown is susceptible to denial of service. A 48 KB emphasis payload can occupy a single-threaded Node.js process for more than half a minute. A nested-list payload smaller than 500 KB is sufficient to crash the process entirely.
+
+## Timeline
+- 2026-03-04  Private report submitted via GitHub Security Advisory to the markedjs/marked repository
+- 2026-03-05  Maintainer closed the advisory, asserting the issue was not a vulnerability and reflected unsafe caller implementation
+- 2026-03-06  Technical counter-arguments and references to the earlier CVEs were supplied
+- 2026-03-06  Maintainer restated the original position and noted that the prior CVEs predated the documentation of worker-based isolation
+- 2026-03-06  Public disclosure followed because the advisory had been closed without publication, satisfying the disclosure obligation defined by GitHub policy
+
+## Credit
+The issues were discovered by vmfunc (github.com/vmfunc)
